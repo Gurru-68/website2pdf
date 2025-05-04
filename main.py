@@ -1,8 +1,11 @@
+from dataclasses import dataclass, field
 import hashlib
 import os
+import pickle
 import re
 import asyncio
 import argparse
+import time
 from urllib.parse import urljoin, urlparse
 from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
@@ -16,8 +19,15 @@ from PyPDF2.generic import (
 )
 from reportlab.pdfgen import canvas
 
+@dataclass
+class State:
+    visited: set = field(default_factory=set)
+    visited_hashes: set = field(default_factory=set)
+    to_visit_next: set = field(default_factory=set)
+    
 OUTPUT_DIR = "website_pdfs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+STATE_FILE = os.path.join(OUTPUT_DIR, "state.pkl")
 
 # Argument Parser to add options
 parser = argparse.ArgumentParser(description="Crawl a website and save as PDFs.")
@@ -38,24 +48,57 @@ parser.add_argument(
     help="Max depth of the crawl (0 = root page only)",
     default=0,
 )
+parser.add_argument(
+    "-S",
+    "--sleep",
+    type=int,
+    help="Number of seconds to wait between each page to avoid overflowing the server (0 = no wait)",
+    default=5,
+)
+parser.add_argument(
+    "-N",
+    "--onlynew",
+    choices=['yes', 'no'],
+    help="Handling of existing documents ('yes' = Skip existing documents, 'no' = overwrite them)",
+    default='yes',
+)
+parser.add_argument(
+    "-W",
+    "--minwords",
+    type=int,
+    help="Minimum number of words to store the page as PDF",
+    default=0,
+)
 args = parser.parse_args()
 
 
 async def crawl_and_save_pdf(
     url,
-    visited,
-    visited_hashes,
+    state,
     browser,
     base_url,
     depth,
     max_depth,
     exclude_texts,
     pdf_info,
+    sleep_seconds,
+    min_words=0,
 ):
-    normalized_url = normalize_url(url)
-    if normalized_url in visited or depth > max_depth:
+    if depth == max_depth + 1:
+        state.to_visit_next.add(url)
+        # Save the state to a file
+        with open(STATE_FILE, "wb") as f:
+            pickle.dump(state, f)
+        print(f"Max depth reached for {url}, skipping further crawling.")
         return
-    visited.add(normalized_url)
+    else:
+        state.to_visit_next.discard(url)
+
+    normalized_url = normalize_url(url)
+    if normalized_url in state.visited or depth > max_depth:
+        print(f"Already visited {url}, skipping.")
+        return
+    state.visited.add(normalized_url)
 
     # Create browser context and page
     context = await browser.new_context()
@@ -69,18 +112,32 @@ async def crawl_and_save_pdf(
         content = await page.content()
         content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
 
-        if content_hash in visited_hashes:
+        if content_hash in state.visited_hashes:
             print(f"Duplicate content found at {url}, skipping.")
             return
-        visited_hashes.add(content_hash)
+        state.visited_hashes.add(content_hash)
 
-        # Save the page as a PDF
-        sanitized_url = re.sub(r"[^a-zA-Z0-9]", "_", normalized_url)
-        page_path = os.path.join(OUTPUT_DIR, f"{sanitized_url}.pdf")
-        await page.pdf(path=page_path)
-        print(f"Saved: {url} to {page_path}")
-
+        document_too_short = False
         soup = BeautifulSoup(content, "html.parser")
+        if min_words > 0:
+            # Count words in the body text
+            word_count = 0
+            for para in soup.find_all('p'):
+                word_count += len(para.get_text().split())
+            if word_count < min_words:
+                print(f"Page {url} has only {word_count} words, skipping PDF creation.")
+                document_too_short = True
+
+        if not document_too_short:
+            # Save the page as a PDF
+            sanitized_url = re.sub(r"[^a-zA-Z0-9]", "_", normalized_url)
+            page_path = os.path.join(OUTPUT_DIR, f"{sanitized_url}.pdf")
+            await page.pdf(path=page_path)
+            print(f"Saved: {url} to {page_path}")
+
+        if sleep_seconds > 0:
+            # Sleep to avoid overwhelming the server
+            time.sleep(sleep_seconds)
 
         # Try to get the first <h1> tag text for a better title
         h1_tag = soup.find("h1")
@@ -90,16 +147,21 @@ async def crawl_and_save_pdf(
             # Fallback to page title
             title = await page.title()
 
-        # Collect information for TOC
-        pdf_info.append(
-            {
-                "title": title,
-                "url": normalized_url,
-                "file_path": page_path,
-                "num_pages": None,  # Will fill later
-                "start_page": None,  # Will fill later
-            }
-        )
+        if not document_too_short:
+            # Collect information for TOC
+            pdf_info.append(
+                {
+                    "title": title,
+                    "url": normalized_url,
+                    "file_path": page_path,
+                    "num_pages": None,  # Will fill later
+                    "start_page": None,  # Will fill later
+                }
+            )
+
+        # Save the state to a file
+        with open(STATE_FILE, "wb") as f:
+            pickle.dump(state, f)
 
         # Extract links for further traversal
         for link_tag in soup.find_all("a", href=True):
@@ -125,18 +187,19 @@ async def crawl_and_save_pdf(
             parsed_base_url = urlparse(base_url)
             if (
                 parsed_next_url.netloc == parsed_base_url.netloc
-                and normalized_next_url not in visited
+                and normalized_next_url not in state.visited
             ):
                 await crawl_and_save_pdf(
                     next_url,
-                    visited,
-                    visited_hashes,
+                    state,
                     browser,
                     base_url,
                     depth + 1,
                     max_depth,
                     exclude_texts,
                     pdf_info,
+                    sleep_seconds,
+                    min_words,
                 )
 
     except Exception as e:
@@ -262,23 +325,43 @@ def add_internal_links(output_filename, link_rects, pdf_info):
     print(f"Internal links added to {output_filename}")
 
 
-async def main(root_url, exclude_texts, max_depth):
+async def main(root_url, exclude_texts, max_depth, sleep_seconds, only_new, min_words):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        visited = set()
-        visited_hashes = set()
+        state = State(set(), set(), set())
+
+        state.to_visit_next.add(root_url)
+
+        if only_new != 'no':
+            try:
+                # Load the previous state if it exists
+                with open(STATE_FILE, "rb") as f:
+                    state = pickle.load(f)
+            except FileNotFoundError:
+                print("No previous state found, starting fresh.")
+            except Exception as e:
+                print(f"Error loading state: {e}")
+
         pdf_info = []  # To store information about each crawled page
-        await crawl_and_save_pdf(
-            root_url,
-            visited,
-            visited_hashes,
-            browser,
-            root_url,
-            0,
-            max_depth,
-            exclude_texts,
-            pdf_info,
-        )
+
+        urls = set(state.to_visit_next)
+        i = 0
+        tot_uls = len(urls)
+        for url in urls:
+            i += 1
+            print(f"\nProcessing {i}/{tot_uls}: {url}\n")
+            await crawl_and_save_pdf(
+                url,
+                state,
+                browser,
+                root_url,
+                0,
+                max_depth,
+                exclude_texts,
+                pdf_info,
+                sleep_seconds,
+                min_words,
+            )
         await browser.close()
 
     # Generate TOC and get link positions
@@ -324,4 +407,4 @@ def normalize_url(url):
 
 
 if __name__ == "__main__":
-    asyncio.run(main(args.root_url, args.exclude, args.level))
+    asyncio.run(main(args.root_url, args.exclude, args.level, args.sleep, args.onlynew, args.minwords))
