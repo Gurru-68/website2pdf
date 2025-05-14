@@ -328,40 +328,42 @@ def add_internal_links(output_filename, link_rects, pdf_info):
 async def main(root_url, exclude_texts, max_depth, sleep_seconds, only_new, min_words):
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        state = State(set(), set(), set())
+        for i in range(50):
+            state = State(set(), set(), set())
 
-        state.to_visit_next.add(root_url)
+            state.to_visit_next.add(root_url)
 
-        if only_new != 'no':
-            try:
-                # Load the previous state if it exists
-                with open(STATE_FILE, "rb") as f:
-                    state = pickle.load(f)
-            except FileNotFoundError:
-                print("No previous state found, starting fresh.")
-            except Exception as e:
-                print(f"Error loading state: {e}")
+            if only_new != 'no':
+                try:
+                    # Load the previous state if it exists
+                    with open(STATE_FILE, "rb") as f:
+                        state = pickle.load(f)
+                except FileNotFoundError:
+                    print("No previous state found, starting fresh.")
+                except Exception as e:
+                    print(f"Error loading state: {e}")
 
-        pdf_info = []  # To store information about each crawled page
+            pdf_info = []  # To store information about each crawled page
 
-        urls = set(state.to_visit_next)
-        i = 0
-        tot_uls = len(urls)
-        for url in urls:
-            i += 1
-            print(f"\nProcessing {i}/{tot_uls}: {url}\n")
-            await crawl_and_save_pdf(
-                url,
-                state,
-                browser,
-                root_url,
-                0,
-                max_depth,
-                exclude_texts,
-                pdf_info,
-                sleep_seconds,
-                min_words,
-            )
+            urls = set(state.to_visit_next)
+            i = 0
+            tot_uls = len(urls)
+            for url in urls:
+                i += 1
+                print(f"\nProcessing {i}/{tot_uls}: {url}\n")
+                await crawl_and_save_pdf(
+                    url,
+                    state,
+                    browser,
+                    root_url,
+                    0,
+                    max_depth,
+                    exclude_texts,
+                    pdf_info,
+                    sleep_seconds,
+                    min_words,
+                )
+
         await browser.close()
 
     # Generate TOC and get link positions

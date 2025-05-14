@@ -165,4 +165,5 @@ cython_debug/
 #  This is a personal collection of files that I don't want to see in my git status.
 .vscode/
 https___communisme_ch/
+https___marxist_com/
 website_pdfs/
